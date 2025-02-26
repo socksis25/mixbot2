@@ -1,4 +1,5 @@
 import discord
+from discord.ext import commands, tasks
 from discord import app_commands
 import os
 from threading import Thread
@@ -6,12 +7,21 @@ from flask import Flask
 import sqlite3
 import random
 import datetime
+from datetime import datetime, timedelta
+import json
+import asyncio
+
+# Constants
+VIP_ROLE_ID = 1344356733866479687
+ADMIN_ROLE_ID = 1342389265216311329
+ROLE_DATA_FILE = 'role_data.json'
 
 class Bot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
+        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -23,6 +33,19 @@ class Bot(discord.Client):
         conn.commit()
         conn.close()
 
+        # Load VIP role data
+        self.role_data = self.load_role_data()
+
+    def load_role_data(self):
+        if os.path.exists(ROLE_DATA_FILE):
+            with open(ROLE_DATA_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+
+    def save_role_data(self):
+        with open(ROLE_DATA_FILE, 'w') as f:
+            json.dump(self.role_data, f)
+
     async def setup_hook(self):
         try:
             await self.tree.sync()
@@ -31,7 +54,57 @@ class Bot(discord.Client):
 
 client = Bot()
 
-ADMIN_ROLE_ID = 1342389265216311329
+@client.event
+async def on_message(message):
+    if message.author == client.user:
+        return
+
+    # Image-only channel handling
+    image_only_channels = [1334751722702114817, 1342384110534131784]
+    if message.channel.id in image_only_channels:
+        has_image = len(message.attachments) > 0 and any(att.content_type.startswith('image/') for att in message.attachments)
+
+        if has_image:
+            try:
+                await message.add_reaction('✅')
+            except:
+                pass
+        else:
+            try:
+                await message.delete()
+                warning = await message.channel.send(
+                    f"{message.author.mention} Only image messages are allowed in this channel!",
+                    delete_after=5
+                )
+            except:
+                pass
+
+@client.event
+async def on_voice_state_update(member, before, after):
+    orders_channel_id = 1342383711685050419
+
+    if member.bot:
+        return
+
+    try:
+        guild = member.guild
+        channel = guild.get_channel(orders_channel_id)
+        if not channel:
+            return
+
+        # Check if someone is in the orders channel
+        orders_channel = guild.get_channel(orders_channel_id)
+        real_members = [m for m in orders_channel.members if not m.bot]
+        current_count = len(real_members)
+
+        # Update channel name based on member count
+        desired_name = "🟢TAKING ORDERS🟢" if current_count > 0 else "🔴TAKING ORDERS🔴"
+
+        if channel.name != desired_name:
+            await channel.edit(name=desired_name)
+
+    except Exception as e:
+        print(f"Voice channel update error: {e}")
 
 def is_admin(interaction: discord.Interaction) -> bool:
     return any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
@@ -46,7 +119,7 @@ async def credits(interaction: discord.Interaction, user: discord.User = None):
     balance = result[0] if result else 0
     conn.close()
 
-    meals = balance // 15  # Integer division by 15 (15 credits = 1 meal at $42)
+    meals = balance // 15
     embed = discord.Embed(title="💳 Credit Balance", color=discord.Color.blue())
     embed.add_field(name="User", value=target_user.mention, inline=False)
     embed.add_field(name="Balance", value=f"{balance} credits", inline=False)
@@ -58,7 +131,7 @@ async def credits(interaction: discord.Interaction, user: discord.User = None):
 async def topup(interaction: discord.Interaction, user: discord.User, amount: int):
     if not is_admin(interaction):
         embed = discord.Embed(title="❌ Error", description="You don't have permission to use this command!", color=discord.Color.red())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     conn = sqlite3.connect('accounts.db')
@@ -67,7 +140,6 @@ async def topup(interaction: discord.Interaction, user: discord.User, amount: in
               (user.id, amount, user.id, amount))
     conn.commit()
 
-    # Get updated balance
     c.execute('SELECT balance FROM credits WHERE user_id = ?', (user.id,))
     new_balance = c.fetchone()[0]
     conn.close()
@@ -83,7 +155,7 @@ async def topup(interaction: discord.Interaction, user: discord.User, amount: in
 async def deduct(interaction: discord.Interaction, user: discord.User, amount: int):
     if not is_admin(interaction):
         embed = discord.Embed(title="❌ Error", description="You don't have permission to use this command!", color=discord.Color.red())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     conn = sqlite3.connect('accounts.db')
@@ -94,14 +166,13 @@ async def deduct(interaction: discord.Interaction, user: discord.User, amount: i
 
     if current_balance < amount:
         embed = discord.Embed(title="❌ Error", description=f"User only has {current_balance} credits!", color=discord.Color.red())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         conn.close()
         return
 
     c.execute('UPDATE credits SET balance = balance - ? WHERE user_id = ?', (amount, user.id))
     conn.commit()
 
-    # Get updated balance
     c.execute('SELECT balance FROM credits WHERE user_id = ?', (user.id,))
     new_balance = c.fetchone()[0]
     conn.close()
@@ -113,13 +184,64 @@ async def deduct(interaction: discord.Interaction, user: discord.User, amount: i
     embed.set_footer(text=f"Deducted by {interaction.user.name}")
     await interaction.response.send_message(embed=embed)
 
+@client.tree.command(name="givevip", description="Give VIP role to a user")
+async def givevip(interaction: discord.Interaction, member: discord.Member, days: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("You don't have permission to use this command!", ephemeral=True)
+        return
+
+    if days <= 0:
+        await interaction.response.send_message("Days must be positive!", ephemeral=True)
+        return
+
+    vip_role = interaction.guild.get_role(VIP_ROLE_ID)
+    if not vip_role:
+        await interaction.response.send_message("VIP role not found!", ephemeral=True)
+        return
+
+    await member.add_roles(vip_role)
+    expiration = (datetime.now() + timedelta(days=days)).timestamp()
+    client.role_data[str(member.id)] = expiration
+    client.save_role_data()
+
+    await interaction.response.send_message(f"Gave {member.mention} VIP role for {days} days!")
+
+@client.tree.command(name="revokevip", description="Revoke VIP role from a user")
+async def revokevip(interaction: discord.Interaction, member: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("You don't have permission to use this command!", ephemeral=True)
+        return
+
+    vip_role = interaction.guild.get_role(VIP_ROLE_ID)
+    if not vip_role:
+        await interaction.response.send_message("VIP role not found!", ephemeral=True)
+        return
+
+    await member.remove_roles(vip_role)
+    if str(member.id) in client.role_data:
+        del client.role_data[str(member.id)]
+        client.save_role_data()
+
+    await interaction.response.send_message(f"Removed VIP role from {member.mention}!")
+
+@client.tree.command(name="vipstatus", description="Check your VIP status")
+async def vipstatus(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    if user_id not in client.role_data:
+        await interaction.response.send_message("You don't have VIP status!", ephemeral=True)
+        return
+
+    expiration = datetime.fromtimestamp(client.role_data[user_id])
+    days_left = (expiration - datetime.now()).days
+    await interaction.response.send_message(f"You have {days_left} days of VIP remaining!")
+
 last_draw_timestamp = 0
 
 @client.tree.command(name="draw", description="Draw a random winner from messages")
 async def draw(interaction: discord.Interaction, prize: str):
     if not is_admin(interaction):
         embed = discord.Embed(title="❌ Error", description="You don't have permission to use this command!", color=discord.Color.red())
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     global last_draw_timestamp
@@ -130,16 +252,13 @@ async def draw(interaction: discord.Interaction, prize: str):
         await interaction.response.send_message("Cannot find the specified channel!", ephemeral=True)
         return
 
-    # Get messages after the last draw
     messages = []
     if last_draw_timestamp == 0:
-        # First draw - get all messages
         async for message in channel.history(limit=500):
             if message.attachments and any(att.content_type.startswith('image/') for att in message.attachments):
                 messages.append(message)
     else:
-        # Subsequent draws - get messages after last draw
-        after_time = datetime.datetime.fromtimestamp(last_draw_timestamp, datetime.timezone.utc)
+        after_time = datetime.fromtimestamp(last_draw_timestamp, datetime.timezone.utc)
         async for message in channel.history(limit=500, after=after_time):
             if message.attachments and any(att.content_type.startswith('image/') for att in message.attachments):
                 messages.append(message)
@@ -148,11 +267,9 @@ async def draw(interaction: discord.Interaction, prize: str):
         await interaction.response.send_message("No eligible entries found since the last draw!", ephemeral=True)
         return
 
-    # Select a random winner
     winner_message = random.choice(messages)
     last_draw_timestamp = int(winner_message.created_at.timestamp())
 
-    # Create announcement embed
     embed = discord.Embed(title="🎉 Draw Winner!", color=discord.Color.gold())
     embed.add_field(name="Winner", value=winner_message.author.mention, inline=False)
     embed.add_field(name="Prize", value=prize, inline=False)
@@ -163,7 +280,6 @@ async def draw(interaction: discord.Interaction, prize: str):
     embed.add_field(name="Winning Entry", value=f"[Jump to message]({winner_message.jump_url})", inline=False)
     embed.set_footer(text=f"Draw conducted by {interaction.user.name}")
 
-    # Create reroll button
     class RerollView(discord.ui.View):
         def __init__(self):
             super().__init__()
@@ -191,16 +307,71 @@ async def draw(interaction: discord.Interaction, prize: str):
 
     await interaction.response.send_message(embed=embed, view=RerollView())
 
+async def check_expired_roles():
+    while True:
+        current_time = datetime.now().timestamp()
+        expired_users = []
+
+        for user_id, expiration in client.role_data.items():
+            if expiration <= current_time:
+                expired_users.append(user_id)
+
+        if expired_users:
+            for guild in client.guilds:
+                vip_role = guild.get_role(VIP_ROLE_ID)
+                if vip_role:
+                    for user_id in expired_users:
+                        try:
+                            member = await guild.fetch_member(int(user_id))
+                            if member:
+                                await member.remove_roles(vip_role)
+                                del client.role_data[user_id]
+                        except:
+                            pass
+            client.save_role_data()
+
+        await asyncio.sleep(300)  # Check every 5 minutes
+
 @client.event
 async def on_ready():
     print(f'Logged in as {client.user}')
     await client.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="BIGMIX.STORE"))
+    client.loop.create_task(check_expired_roles())
 
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is alive!"
+    try:
+        vip_count = len(client.role_data) if hasattr(client, 'role_data') else 0
+        return f"""
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Discord Bot Status</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 40px;
+            }}
+            .status {{
+                padding: 20px;
+                background: #e8f5e9;
+                border-radius: 8px;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>Discord Bot Status</h1>
+        <div class="status">
+            <p>Bot is running!</p>
+            <p>Current VIP users: {vip_count}</p>
+        </div>
+    </body>
+</html>
+"""
+    except Exception as e:
+        return f"Bot status: Running (Error displaying VIP count: {str(e)})"
 
 def run():
     app.run(host='0.0.0.0', port=8080)
